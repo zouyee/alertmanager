@@ -14,36 +14,42 @@
 package api
 
 import (
+	"bufio"
+	"crypto/md5"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"html/template"
+	"io"
+	"math/rand"
 	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"time"
-	"encoding/xml"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
-	"github.com/satori/go.uuid"
-	"golang.org/x/net/context"
+	"github.com/prometheus/prometheus/pkg/labels"
 
+	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
+	"github.com/prometheus/alertmanager/pkg/parse"
 	"github.com/prometheus/alertmanager/provider"
+	"github.com/prometheus/alertmanager/silence"
+	"github.com/prometheus/alertmanager/silence/silencepb"
 	"github.com/prometheus/alertmanager/types"
-	"os"
-	"bufio"
-	"strings"
-	"io"
-	"io/ioutil"
-	"text/template"
-	"crypto/md5"
-	"encoding/hex"
-	"math/rand"
-	"database/sql"
-	_ "github.com/mattn/go-sqlite3"
-
+	"github.com/weaveworks/mesh"
 )
 
 var (
@@ -68,115 +74,117 @@ func init() {
 // API provides registration of handlers for API routes.
 type API struct {
 	alerts         provider.Alerts
-	silences       provider.Silences
-	config         string
+	silences       *silence.Silences
+	config         *config.Config
+	route          *dispatch.Route
 	resolveTimeout time.Duration
 	uptime         time.Time
+	mrouter        *mesh.Router
 
-	groups func() dispatch.AlertOverview
+	groups         groupsFn
+	getAlertStatus getAlertStatusFn
 
-	// context is an indirection for testing.
-	context func(r *http.Request) context.Context
-	mtx     sync.RWMutex
+	mtx sync.RWMutex
 }
 
+type groupsFn func([]*labels.Matcher) dispatch.AlertOverview
+type getAlertStatusFn func(model.Fingerprint) types.AlertStatus
+
 // New returns a new API.
-func New(alerts provider.Alerts, silences provider.Silences, gf func() dispatch.AlertOverview) *API {
+func New(alerts provider.Alerts, silences *silence.Silences, gf groupsFn, sf getAlertStatusFn, router *mesh.Router) *API {
 	return &API{
-		context:  route.Context,
-		alerts:   alerts,
-		silences: silences,
-		groups:   gf,
-		uptime:   time.Now(),
+		alerts:         alerts,
+		silences:       silences,
+		groups:         gf,
+		getAlertStatus: sf,
+		uptime:         time.Now(),
+		mrouter:        router,
 	}
 }
 
-// alert struct
-
 type Labels struct {
-	AlertSeverity	string `json:"severity"`
-}
-type AlertJsonStruct struct {
-	AlertName	string `json:"alert"`
-	AlertAddition	string   `json:"if"`
-	AlertTime	string	`json:"for"`
-	AlertSeverity	Labels	`json:"labels"`
-	AlertDescription	string `json:"annotations"`
+	AlertSeverity string `json:"severity"`
 }
 
+type AlertJsonStruct struct {
+	AlertName        string `json:"alert"`
+	AlertAddition    string `json:"if"`
+	AlertTime        string `json:"for"`
+	AlertSeverity    Labels `json:"labels"`
+	AlertDescription string `json:"annotations"`
+}
 
 type alertsResponseJSONStruct struct {
-	Array []AlertJsonStruct	`json:"alerts"`
+	Array []AlertJsonStruct `json:"alerts"`
 }
 
 type AlertInfo struct {
-	Status string `json:"status"`
-	Labels Label `json:"labels"`
-	Annotations Annotation `json:"annotations"`
-	StartsAt string `json:"startsAt"`
-	EndsAt string `json:"endsAt"`
-	GeneratorURL string `json:"generatorURL"`
+	Status       string     `json:"status"`
+	Labels       Label      `json:"labels"`
+	Annotations  Annotation `json:"annotations"`
+	StartsAt     string     `json:"startsAt"`
+	EndsAt       string     `json:"endsAt"`
+	GeneratorURL string     `json:"generatorURL"`
+}
 
-}
-type Annotation struct{
+type Annotation struct {
 	Description string `json:"description"`
-	Summary string `json:"summary"`
+	Summary     string `json:"summary"`
 }
-type Label struct{
+
+type Label struct {
 	AlertName string `json:"alertname，omitempty"`
-	Group string `json:"group，omitempty"`
-	Instance string `json:"instance，omitempty"`
-	Job string `json:"job，omitempty"`
-	Monitor string `json:"monitor，omitempty"`
-	Severity string `json:"severity，omitempty"`
+	Group     string `json:"group，omitempty"`
+	Instance  string `json:"instance，omitempty"`
+	Job       string `json:"job，omitempty"`
+	Monitor   string `json:"monitor，omitempty"`
+	Severity  string `json:"severity，omitempty"`
 }
 type GroupLabel struct {
 	AlertName string `json:"alertname，omitempty"`
 }
 
-type AlarmJsonStruct struct{
-	Receiver string `json:"-"`
-	Status string `json:"-"`
-	Alerts []AlertInfo `json:"alerts"`
-	GroupLabels GroupLabel `json:"groupLabels"`
-	CommonLabels Label `json:"commonLabels"`
-	ExternalURL string `json:"externalURL"`
-	Version string `json:"version"`
-	GroupKey uint64 `json:"groupKey"`
-
+type AlarmJsonStruct struct {
+	Receiver     string      `json:"-"`
+	Status       string      `json:"-"`
+	Alerts       []AlertInfo `json:"alerts"`
+	GroupLabels  GroupLabel  `json:"groupLabels"`
+	CommonLabels Label       `json:"commonLabels"`
+	ExternalURL  string      `json:"externalURL"`
+	Version      string      `json:"version"`
+	GroupKey     uint64      `json:"groupKey"`
 }
 
-type Member struct{
-	Source string `xml:"source,attr"`
-	Code string `xml:"code,attr"`
-	Grade string `xml:"grade,attr"`
-	Time string `xml:"time,attr"`
-	CaseId string `xml:"caseid,attr"`
+type Member struct {
+	Source      string `xml:"source,attr"`
+	Code        string `xml:"code,attr"`
+	Grade       string `xml:"grade,attr"`
+	Time        string `xml:"time,attr"`
+	CaseId      string `xml:"caseid,attr"`
 	Description string `xml:",chardata"`
-
 }
 
-type Struct struct{
-	Name string `xml:"dn,attr"`
+type Struct struct {
+	Name    string `xml:"dn,attr"`
 	Members Member `xml:"alarm"`
 }
 
-type Result struct{
+type Result struct {
 	XMLName xml.Name `xml:"dc"`
 	Structs []Struct `xml:"mo"`
 }
 
-type UserModal struct{
-	Uid int `json:"uid"`
-	Uname string `json:"uname"`
-	Mname string `json:"mname"`
-	Cpus float64 `json:"cpus"`
-	Mem float64 `json:"mem"`
-	Disk float64 `json:"disk"`
+type UserModal struct {
+	Uid      int     `json:"uid"`
+	Uname    string  `json:"uname"`
+	Mname    string  `json:"mname"`
+	Cpus     float64 `json:"cpus"`
+	Mem      float64 `json:"mem"`
+	Disk     float64 `json:"disk"`
 	Instance float64 `json:"instances"`
 }
 type ModalResponseJSONStruct struct {
-	Array []UserModal	`json:"modals"`
+	Array []UserModal `json:"modals"`
 }
 
 // alert teml
@@ -194,16 +202,21 @@ ANNOTATIONS {
 `
 
 func GetMd5String(s string) string {
-    h := md5.New()
-    h.Write([]byte(s))
-    return hex.EncodeToString(h.Sum(nil))
+	h := md5.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-const Header = `<?xml version="1.0" encoding="gb2312"?>` + "\n"
 // Register registers the API handlers under their correct routes
 // in the given router.
 func (api *API) Register(r *route.Router) {
-	ihf := prometheus.InstrumentHandlerFunc
+	ihf := func(name string, f http.HandlerFunc) http.HandlerFunc {
+		return prometheus.InstrumentHandlerFunc(name, func(w http.ResponseWriter, r *http.Request) {
+			f(w, r)
+		})
+	}
+
+	r.Options("/*path", ihf("options", func(w http.ResponseWriter, r *http.Request) {}))
 
 	// Register legacy forwarder for alert pushing.
 	r.Post("/alerts", ihf("legacy_add_alerts", api.legacyAddAlerts))
@@ -211,40 +224,124 @@ func (api *API) Register(r *route.Router) {
 	// Register actual API.
 	r = r.WithPrefix("/v1")
 
-	// alerts api
 	r.Get("/status", ihf("status", api.status))
+	r.Get("/receivers", ihf("receivers", api.receivers))
 	r.Get("/alerts/groups", ihf("alert_groups", api.alertGroups))
+
 	r.Get("/alerts", ihf("list_alerts", api.listAlerts))
 	r.Post("/alerts", ihf("add_alerts", api.addAlerts))
 
-	// silences config api and crud
-	r.Get("/silences", ihf("list_silences", api.listSilences))
-	r.Post("/silences", ihf("add_silence", api.addSilence))
-	r.Get("/silence/:sid", ihf("get_silence", api.getSilence))
-	r.Del("/silence/:sid", ihf("del_silence", api.delSilence))
 	// alarms crud api
 	r.Get("/alarms", ihf("list_alarms", api.listAlarms))
 	r.Post("/alarms", ihf("add_alarm", api.addAlarm))
 	r.Post("/alarms/:alarmname", ihf("edit_alarm", api.editAlarm))
 	r.Del("/alarms/:alarmname", ihf("del_alarm", api.delAlarm))
-	// alarms event reciver
-	r.Post("/monitor", ihf("monitor", api.monitor))
-	//proxy
-	r.Get("/proxy/:address",ihf("proxy",api.proxy))
+
+	// bomc alarm
+	r.Post("/bomc/webhook", ihf("webhook", api.webhook))
+	r.Get("/bomc", ihf("list_bomcs", api.listBomcs))
+	r.Post("/bomc", ihf("add_bomcs", api.addBomcs))
+	r.Put("/bomc/:bomcid", ihf("update_bomcs", api.updateBomc))
+	r.Del("/bomc/:bomcid", ihf("delete_bomcs", api.deleteBomc))
+
+	r.Get("/silences", ihf("list_silences", api.listSilences))
+	r.Post("/silences", ihf("add_silence", api.setSilence))
+	r.Get("/silence/:sid", ihf("get_silence", api.getSilence))
+	r.Del("/silence/:sid", ihf("del_silence", api.delSilence))
+
 	// modal crub
-	r.Get("/modals/:username",ihf("list_modals",api.listModals))
-	r.Post("/modals/:username",ihf("add_modal",api.addModal))
-	r.Put("/modals/:modalid",ihf("update_modal",api.updateModal))
-	r.Del("/modals/:modalid",ihf("delete_modal",api.deleteModal))
+	r.Get("/modals/:username", ihf("list_modals", api.listModals))
+	r.Post("/modals/:username", ihf("add_modal", api.addModal))
+	r.Put("/modals/:modalid", ihf("update_modal", api.updateModal))
+	r.Del("/modals/:modalid", ihf("delete_modal", api.deleteModal))
+
+}
+
+// Bomc define
+type Bomc struct {
+	BomcID      string `json:"bomcID"`
+	Description string `json:"description"`
+}
+
+func (api *API) webhook(w http.ResponseWriter, r *http.Request) {
+	var s []model.Alert
+	/*
+		grade := map[string]string{
+			"critical": "4",
+			"major":    "3",
+			"minor":    "2",
+			"warning":  "1",
+		}
+		fmt.Printf("json post reciver %s", r)
+	*/
+
+	if err := receive(r, &s); err != nil {
+		respondError(w, apiError{
+			typ: errorBadData,
+			err: err,
+		}, nil)
+		return
+	}
+	for _, alert := range s {
+		var Source, caseID, ALARMID string
+
+		if instance, ok := alert.Labels["instance"]; ok {
+			caseID = string(alert.Labels["alertname"]) + string(instance)
+		}
+		caseID = string(alert.Labels["alertname"])
+
+		startAt, err := time.Parse("2006-01-02__15:04:05", alert.StartsAt.String())
+		if err != nil {
+			panic(err)
+		}
+
+		description := strings.Split(string(alert.Annotations["description"]), ":")
+		ALARM := strings.Split(string(alert.Annotations["description"]), "#")
+
+		if len(ALARM) == 3 {
+			ALARMID = ALARM[2]
+		}
+		if strings.Split(string(alert.Annotations["description"]), ":")[1] == "node" {
+			Source = string(alert.Labels["instance"])
+		} else {
+			Source = strings.Split(string(alert.Annotations["description"]), ":")[7]
+		}
+
+		cmd := exec.Command("trap4j", `$OID`, `$COMPONENT`, `$ALERTGROUP`,
+			`$ALARMID`, `$INSTANCE`, `$ALARMCONTENT`,
+			`$REVOKEID`, `$VALUE`, `$TIME`)
+
+		cmd.Env = append(os.Environ(),
+			"OID=9001.221",
+			"COMPONENT="+Source,
+			"ALERTGROUP="+description[1],
+			"ALARMID="+ALARMID,
+			"INSTANCE="+caseID,
+			"ALARMCONTENT="+string(alert.Annotations["description"]),
+			"REVOKEID=1",
+			"VALUE="+description[4],
+			"TIME="+startAt.String(),
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Printf("output:=======%s", out)
+
+	}
+
+	respond(w, nil)
 }
 
 // Update sets the configuration string to a new value.
-func (api *API) Update(config string, resolveTimeout time.Duration) {
+func (api *API) Update(cfg *config.Config, resolveTimeout time.Duration) error {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
 
-	api.config = config
 	api.resolveTimeout = resolveTimeout
+	api.config = cfg
+	api.route = dispatch.NewRoute(cfg.Route, nil)
+	return nil
 }
 
 type errorType string
@@ -264,15 +361,30 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.typ, e.err)
 }
 
+func (api *API) receivers(w http.ResponseWriter, req *http.Request) {
+	api.mtx.RLock()
+	defer api.mtx.RUnlock()
+
+	receivers := make([]string, 0, len(api.config.Receivers))
+	for _, r := range api.config.Receivers {
+		receivers = append(receivers, r.Name)
+	}
+
+	respond(w, receivers)
+}
+
 func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	api.mtx.RLock()
 
 	var status = struct {
-		Config      string            `json:"config"`
+		ConfigYAML  string            `json:"configYAML"`
+		ConfigJSON  *config.Config    `json:"configJSON"`
 		VersionInfo map[string]string `json:"versionInfo"`
 		Uptime      time.Time         `json:"uptime"`
+		MeshStatus  *meshStatus       `json:"meshStatus"`
 	}{
-		Config: api.config,
+		ConfigYAML: api.config.String(),
+		ConfigJSON: api.config,
 		VersionInfo: map[string]string{
 			"version":   version.Version,
 			"revision":  version.Revision,
@@ -281,7 +393,8 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 			"buildDate": version.BuildDate,
 			"goVersion": version.GoVersion,
 		},
-		Uptime: api.uptime,
+		Uptime:     api.uptime,
+		MeshStatus: getMeshStatus(api),
 	}
 
 	api.mtx.RUnlock()
@@ -289,24 +402,154 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	respond(w, status)
 }
 
-func (api *API) alertGroups(w http.ResponseWriter, req *http.Request) {
-	respond(w, api.groups())
+type meshStatus struct {
+	Name     string       `json:"name"`
+	NickName string       `json:"nickName"`
+	Peers    []peerStatus `json:"peers"`
+}
+
+type peerStatus struct {
+	Name     string `json:"name"`     // e.g. "00:00:00:00:00:01"
+	NickName string `json:"nickName"` // e.g. "a"
+	UID      uint64 `json:"uid"`      // e.g. "14015114173033265000"
+}
+
+func getMeshStatus(api *API) *meshStatus {
+	if api.mrouter == nil {
+		return nil
+	}
+
+	status := mesh.NewStatus(api.mrouter)
+	strippedStatus := &meshStatus{
+		Name:     status.Name,
+		NickName: status.NickName,
+		Peers:    make([]peerStatus, len(status.Peers)),
+	}
+
+	for i := 0; i < len(status.Peers); i++ {
+		strippedStatus.Peers[i] = peerStatus{
+			Name:     status.Peers[i].Name,
+			NickName: status.Peers[i].NickName,
+			UID:      uint64(status.Peers[i].UID),
+		}
+	}
+
+	return strippedStatus
+}
+
+func (api *API) alertGroups(w http.ResponseWriter, r *http.Request) {
+	var err error
+	matchers := []*labels.Matcher{}
+
+	if filter := r.FormValue("filter"); filter != "" {
+		matchers, err = parse.Matchers(filter)
+		if err != nil {
+			respondError(w, apiError{
+				typ: errorBadData,
+				err: err,
+			}, nil)
+			return
+		}
+	}
+
+	groups := api.groups(matchers)
+
+	respond(w, groups)
 }
 
 func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
+	var (
+		err error
+		re  *regexp.Regexp
+		// Initialize result slice to prevent api returning `null` when there
+		// are no alerts present
+		res          = []*dispatch.APIAlert{}
+		matchers     = []*labels.Matcher{}
+		showSilenced = true
+	)
+
+	if filter := r.FormValue("filter"); filter != "" {
+		matchers, err = parse.Matchers(filter)
+		if err != nil {
+			respondError(w, apiError{
+				typ: errorBadData,
+				err: err,
+			}, nil)
+			return
+		}
+	}
+
+	if silencedParam := r.FormValue("silenced"); silencedParam != "" {
+		if silencedParam == "false" {
+			showSilenced = false
+		} else if silencedParam != "true" {
+			respondError(w, apiError{
+				typ: errorBadData,
+				err: fmt.Errorf(
+					"parameter 'silenced' can either be 'true' or 'false', not '%v'",
+					silencedParam,
+				),
+			}, nil)
+			return
+		}
+	}
+
+	if receiverParam := r.FormValue("receiver"); receiverParam != "" {
+		re, err = regexp.Compile("^(?:" + receiverParam + ")$")
+		if err != nil {
+			respondError(w, apiError{
+				typ: errorBadData,
+				err: fmt.Errorf(
+					"failed to parse receiver param: %s",
+					receiverParam,
+				),
+			}, nil)
+			return
+		}
+	}
+
 	alerts := api.alerts.GetPending()
 	defer alerts.Close()
 
-	var (
-		err error
-		res []*types.Alert
-	)
 	// TODO(fabxc): enforce a sensible timeout.
 	for a := range alerts.Next() {
 		if err = alerts.Err(); err != nil {
 			break
 		}
-		res = append(res, a)
+
+		routes := api.route.Match(a.Labels)
+		receivers := make([]string, 0, len(routes))
+		for _, r := range routes {
+			receivers = append(receivers, r.RouteOpts.Receiver)
+		}
+
+		if re != nil && !regexpAny(re, receivers) {
+			continue
+		}
+
+		if !alertMatchesFilterLabels(&a.Alert, matchers) {
+			continue
+		}
+
+		// Continue if alert is resolved
+		if !a.Alert.EndsAt.IsZero() && a.Alert.EndsAt.Before(time.Now()) {
+			continue
+		}
+
+		status := api.getAlertStatus(a.Fingerprint())
+
+		if !showSilenced && len(status.SilencedBy) != 0 {
+			continue
+		}
+
+		apiAlert := &dispatch.APIAlert{
+			Alert:       &a.Alert,
+			Status:      status,
+			Receivers:   receivers,
+			Fingerprint: a.Fingerprint().String(),
+		}
+
+		res = append(res, apiAlert)
 	}
 
 	if err != nil {
@@ -316,7 +559,30 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
-	respond(w, types.Alerts(res...))
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Fingerprint < res[j].Fingerprint
+	})
+	respond(w, res)
+}
+
+func regexpAny(re *regexp.Regexp, ss []string) bool {
+	for _, s := range ss {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func alertMatchesFilterLabels(a *model.Alert, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if v, prs := a.Labels[model.LabelName(m.Name)]; !prs || !m.Matches(string(v)) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (api *API) legacyAddAlerts(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +686,7 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 	respond(w, nil)
 }
 
-func (api *API) addSilence(w http.ResponseWriter, r *http.Request) {
+func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
 	var sil types.Silence
 	if err := receive(r, &sil); err != nil {
 		respondError(w, apiError{
@@ -429,8 +695,8 @@ func (api *API) addSilence(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
-
-	if err := sil.Init(); err != nil {
+	psil, err := silenceToProto(&sil)
+	if err != nil {
 		respondError(w, apiError{
 			typ: errorBadData,
 			err: err,
@@ -438,7 +704,31 @@ func (api *API) addSilence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sid, err := api.silences.Set(&sil)
+	sid, err := api.silences.Set(psil)
+	if err != nil {
+		respondError(w, apiError{
+			typ: errorBadData,
+			err: err,
+		}, nil)
+		return
+	}
+
+	respond(w, struct {
+		SilenceID string `json:"silenceId"`
+	}{
+		SilenceID: sid,
+	})
+}
+
+func (api *API) getSilence(w http.ResponseWriter, r *http.Request) {
+	sid := route.Param(r.Context(), "sid")
+
+	sils, err := api.silences.Query(silence.QIDs(sid))
+	if err != nil || len(sils) == 0 {
+		http.Error(w, fmt.Sprint("Error getting silence: ", err), http.StatusNotFound)
+		return
+	}
+	sil, err := silenceFromProto(sils[0])
 	if err != nil {
 		respondError(w, apiError{
 			typ: errorInternal,
@@ -447,36 +737,13 @@ func (api *API) addSilence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respond(w, struct {
-		SilenceID uuid.UUID `json:"silenceId"`
-	}{
-		SilenceID: sid,
-	})
+	respond(w, sil)
 }
 
-func (api *API) getSilence(w http.ResponseWriter, r *http.Request) {
-	sids := route.Param(api.context(r), "sid")
-	sid, err := uuid.FromString(sids)
-	if err != nil {
-		respondError(w, apiError{
-			typ: errorBadData,
-			err: err,
-		}, nil)
-		return
-	}
-
-	sil, err := api.silences.Get(sid)
-	if err != nil {
-		http.Error(w, fmt.Sprint("Error getting silence: ", err), http.StatusNotFound)
-		return
-	}
-
-	respond(w, &sil)
-}
 func (api *API) listAlarms(w http.ResponseWriter, r *http.Request) {
 	api.mtx.RLock()
 	defer api.mtx.RUnlock()
-	var rs  alertsResponseJSONStruct
+	var rs alertsResponseJSONStruct
 	var al AlertJsonStruct
 	file, err := os.Open("/etc/alertmanager/alert.rules")
 	defer file.Close()
@@ -495,14 +762,14 @@ func (api *API) listAlarms(w http.ResponseWriter, r *http.Request) {
 		case strings.Contains(line, "ALERT"):
 			al.AlertName = strings.Split(line, " ")[1]
 		case strings.Contains(line, "IF"):
-			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1]," ")
+			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1], " ")
 		case strings.Contains(line, "FOR"):
 			al.AlertTime = strings.Split(line, " ")[1]
 		case strings.Contains(line, "LABELS"):
-			al.AlertSeverity = Labels{AlertSeverity:strings.Split(line, "'")[1]}
+			al.AlertSeverity = Labels{AlertSeverity: strings.Split(line, "'")[1]}
 		case strings.Contains(line, "summary"):
 			al.AlertDescription = strings.Split(line, "'")[1]
-			fmt.Printf("Alert list %#v",al)
+			fmt.Printf("Alert list %#v", al)
 			rs.Array = append(rs.Array, al)
 
 		}
@@ -514,7 +781,7 @@ func (api *API) addAlarm(w http.ResponseWriter, r *http.Request) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
 
-	var rs  alertsResponseJSONStruct
+	var rs alertsResponseJSONStruct
 	var al AlertJsonStruct
 	file, err := os.Open("/etc/alertmanager/alert.rules")
 	if err != nil {
@@ -523,7 +790,7 @@ func (api *API) addAlarm(w http.ResponseWriter, r *http.Request) {
 	}
 	rd := bufio.NewReader(file)
 	var result AlertJsonStruct
-	fmt.Printf("request body",r.Body)
+	fmt.Printf("request body", r.Body)
 	if err := receive(r, &result); err != nil {
 		respondError(w, apiError{
 			typ: errorBadData,
@@ -531,7 +798,7 @@ func (api *API) addAlarm(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
-	fmt.Printf("add alarm %#v",result)
+	fmt.Printf("add alarm %#v", result)
 	for {
 		line, err := rd.ReadString('\n')
 		line = strings.Replace(line, "\n", "", -1)
@@ -545,18 +812,18 @@ func (api *API) addAlarm(w http.ResponseWriter, r *http.Request) {
 				respondError(w, apiError{
 					typ: errorBadData,
 					err: fmt.Errorf("%s conflict", result.AlertName),
-					}, nil)
+				}, nil)
 			}
 
 		case strings.Contains(line, "IF"):
-			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1]," ")
+			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1], " ")
 		case strings.Contains(line, "FOR"):
 			al.AlertTime = strings.Split(line, " ")[1]
 		case strings.Contains(line, "LABELS"):
-			al.AlertSeverity = Labels{AlertSeverity:strings.Split(line, "'")[1]}
+			al.AlertSeverity = Labels{AlertSeverity: strings.Split(line, "'")[1]}
 		case strings.Contains(line, "summary"):
 			al.AlertDescription = strings.Split(line, "'")[1]
-			fmt.Printf("Alert list %#v\n",al)
+			fmt.Printf("Alert list %#v\n", al)
 			rs.Array = append(rs.Array, al)
 
 		}
@@ -581,22 +848,19 @@ func (api *API) addAlarm(w http.ResponseWriter, r *http.Request) {
 
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", "http://127.0.0.1:9090/-/reload", nil)
-	res,err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("post reload error %# v", err)
 	}
 	//respond(w, res)
-	fmt.Printf("reload config %#v",res)
+	fmt.Printf("reload config %#v", res)
 	return
-
-
-
 
 }
 func (api *API) editAlarm(w http.ResponseWriter, r *http.Request) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
-	var rs  alertsResponseJSONStruct
+	var rs alertsResponseJSONStruct
 	var al AlertJsonStruct
 	file, err := os.Open("/etc/alertmanager/alert.rules")
 	if err != nil {
@@ -604,7 +868,7 @@ func (api *API) editAlarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rd := bufio.NewReader(file)
-	alertName := route.Param(api.context(r), "alarmname")
+	alertName := route.Param(r.Context(), "alarmname")
 
 	var result AlertJsonStruct
 	if err := receive(r, &result); err != nil {
@@ -614,7 +878,7 @@ func (api *API) editAlarm(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
-	fmt.Printf("add alarm %#v",result)
+	fmt.Printf("add alarm %#v", result)
 	for {
 		line, err := rd.ReadString('\n')
 		line = strings.Replace(line, "\n", "", -1)
@@ -628,25 +892,25 @@ func (api *API) editAlarm(w http.ResponseWriter, r *http.Request) {
 				respondError(w, apiError{
 					typ: errorBadData,
 					err: fmt.Errorf("%s must not be edited", result.AlertName),
-					}, nil)
-			}else if alertName == al.AlertName && result.AlertName == alertName{
+				}, nil)
+			} else if alertName == al.AlertName && result.AlertName == alertName {
 				break
 			}
 		case strings.Contains(line, "IF"):
-			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1]," ")
+			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1], " ")
 		case strings.Contains(line, "FOR"):
 			al.AlertTime = strings.Split(line, " ")[1]
 		case strings.Contains(line, "LABELS"):
-			al.AlertSeverity = Labels{AlertSeverity:strings.Split(line, "'")[1]}
+			al.AlertSeverity = Labels{AlertSeverity: strings.Split(line, "'")[1]}
 		case strings.Contains(line, "summary"):
 			al.AlertDescription = strings.Split(line, "'")[1]
 
 			if alertName == al.AlertName {
 				rs.Array = append(rs.Array, result)
-			}else{
+			} else {
 				rs.Array = append(rs.Array, al)
 			}
-			fmt.Printf("Alert list %#v\n",al)
+			fmt.Printf("Alert list %#v\n", al)
 
 		}
 	}
@@ -668,21 +932,20 @@ func (api *API) editAlarm(w http.ResponseWriter, r *http.Request) {
 	//w.Header().Set("My-Awesome-Header", "Rocks")
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", "http://127.0.0.1:9090/-/reload", nil)
-	res,err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("post reload error %# v", err)
 	}
 	//respond(w, res)
-	fmt.Printf("reload config %#v",res)
+	fmt.Printf("reload config %#v", res)
 	return
-
 
 }
 
 func (api *API) delAlarm(w http.ResponseWriter, r *http.Request) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
-	var rs  alertsResponseJSONStruct
+	var rs alertsResponseJSONStruct
 	var al AlertJsonStruct
 	file, err := os.Open("/etc/alertmanager/alert.rules")
 	if err != nil {
@@ -690,7 +953,7 @@ func (api *API) delAlarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rd := bufio.NewReader(file)
-	result := route.Param(api.context(r), "alarmname")
+	result := route.Param(r.Context(), "alarmname")
 
 	for {
 		line, err := rd.ReadString('\n')
@@ -702,17 +965,17 @@ func (api *API) delAlarm(w http.ResponseWriter, r *http.Request) {
 		case strings.Contains(line, "ALERT"):
 			al.AlertName = strings.Split(line, " ")[1]
 		case strings.Contains(line, "IF"):
-			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1]," ")
+			al.AlertAddition = strings.Trim(strings.Split(line, "IF")[1], " ")
 		case strings.Contains(line, "FOR"):
 			al.AlertTime = strings.Split(line, " ")[1]
 		case strings.Contains(line, "LABELS"):
-			al.AlertSeverity = Labels{AlertSeverity:strings.Split(line, "'")[1]}
+			al.AlertSeverity = Labels{AlertSeverity: strings.Split(line, "'")[1]}
 		case strings.Contains(line, "summary"):
 			al.AlertDescription = strings.Split(line, "'")[1]
 			if result == al.AlertName {
-				fmt.Printf("alarmname %s",result)
+				fmt.Printf("alarmname %s", result)
 				break
-			}else{
+			} else {
 				rs.Array = append(rs.Array, al)
 			}
 		}
@@ -734,35 +997,14 @@ func (api *API) delAlarm(w http.ResponseWriter, r *http.Request) {
 	//w.Header().Set("My-Awesome-Header", "Rocks")
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", "http://127.0.0.1:9090/-/reload", nil)
-	res,err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("post reload error %# v", err)
 	}
-	fmt.Printf("reload config %#v",res)
+	fmt.Printf("reload config %#v", res)
 
 	//respond(w, res)
 	return
-}
-
-func (api *API) proxy(w http.ResponseWriter, r *http.Request) {
-	url := "http://" + route.Param(api.context(r), "address") + ":9090/haproxy?stats;csv"
-	req, err := http.NewRequest("GET",url, nil)
-	resp, err := http.DefaultClient.Do(req)
-	defer resp.Body.Close()
-	if err != nil {
-		panic(err)
-	}
-	for k, v := range resp.Header {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	result, err := ioutil.ReadAll(resp.Body)
-	if err != nil && err != io.EOF {
-		panic(err)
-	}
-	w.Write(result)
 }
 
 func checkErr(w http.ResponseWriter, err error) {
@@ -774,11 +1016,11 @@ func checkErr(w http.ResponseWriter, err error) {
 
 func (api *API) listModals(w http.ResponseWriter, r *http.Request) {
 
-	username := route.Param(api.context(r), "username")
+	username := route.Param(r.Context(), "username")
 	db, err := sql.Open("sqlite3", "./modal.db")
 	defer db.Close()
 	_, err = db.Exec("CREATE TABLE  IF NOT EXISTS userinfo(Uid INTEGER PRIMARY KEY AUTOINCREMENT,Uname VARCHAR(64) NOT NULL,Mname VARCHAR(64) NOT NULL,Cpus FLOAT NOT NULL DEFAULT 0,Mem FLOAT NOT NULL DEFAULT 0,Disk FLOAT NOT NULL DEFAULT 0,Instance FLOAT NOT NULL DEFAULT 0)")
-	sqlStr := fmt.Sprintf("SELECT * FROM userinfo where Uname=%q",username)
+	sqlStr := fmt.Sprintf("SELECT * FROM userinfo where Uname=%q", username)
 	rows, err := db.Query(sqlStr)
 	defer rows.Close()
 	checkErr(w, err)
@@ -786,7 +1028,7 @@ func (api *API) listModals(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var user UserModal
 
-		err = rows.Scan(&user.Uid,&user.Uname,&user.Mname,&user.Cpus,&user.Mem,&user.Disk,&user.Instance)
+		err = rows.Scan(&user.Uid, &user.Uname, &user.Mname, &user.Cpus, &user.Mem, &user.Disk, &user.Instance)
 		checkErr(w, err)
 		result = append(result, user)
 	}
@@ -796,8 +1038,7 @@ func (api *API) listModals(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) addModal(w http.ResponseWriter, r *http.Request) {
 
-	username := route.Param(api.context(r), "username")
-
+	username := route.Param(r.Context(), "username")
 
 	var user UserModal
 	if err := receive(r, &user); err != nil {
@@ -814,7 +1055,7 @@ func (api *API) addModal(w http.ResponseWriter, r *http.Request) {
 	stmt, err := db.Prepare("INSERT INTO userinfo(Uname,Mname, Cpus, Mem, Disk, Instance) values(?,?,?,?,?,?)")
 	checkErr(w, err)
 
-	res, err := stmt.Exec(username, user.Mname, user.Cpus, user.Mem, user.Disk,user.Instance)
+	res, err := stmt.Exec(username, user.Mname, user.Cpus, user.Mem, user.Disk, user.Instance)
 	checkErr(w, err)
 
 	respond(w, res)
@@ -823,7 +1064,7 @@ func (api *API) addModal(w http.ResponseWriter, r *http.Request) {
 func (api *API) updateModal(w http.ResponseWriter, r *http.Request) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
-	modalId := route.Param(api.context(r), "modalid")
+	modalId := route.Param(r.Context(), "modalid")
 	var user UserModal
 	if err := receive(r, &user); err != nil {
 		respondError(w, apiError{
@@ -847,14 +1088,12 @@ func (api *API) updateModal(w http.ResponseWriter, r *http.Request) {
 
 	respond(w, affect)
 
-
-
 }
 
 func (api *API) deleteModal(w http.ResponseWriter, r *http.Request) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
-	modalId := route.Param(api.context(r), "modalid")
+	modalId := route.Param(r.Context(), "modalid")
 
 	db, err := sql.Open("sqlite3", "./modal.db")
 	defer db.Close()
@@ -870,82 +1109,23 @@ func (api *API) deleteModal(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func GetRandomString(leng int) string{
-   str := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-   bytes := []byte(str)
-   result := []byte{}
-   r := rand.New(rand.NewSource(time.Now().UnixNano()))
-   for i := 0; i < leng; i++ {
-      result = append(result, bytes[r.Intn(len(bytes))])
-   }
-   return string(result)
-}
-// monitor:convert post json to xml
-func (api *API) monitor(w http.ResponseWriter, r *http.Request) {
-	var s AlarmJsonStruct
-	var m Result
-	var st Struct
-	grade := map[string]string{
-		"critical": "4",
-		"major": "3",
-		"minor": "2",
-		"warning": "1",
+func GetRandomString(leng int) string {
+	str := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	bytes := []byte(str)
+	result := []byte{}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < leng; i++ {
+		result = append(result, bytes[r.Intn(len(bytes))])
 	}
-	//fmt.Printf("json post reciver %s", r)
-	if err := receive(r, &s); err != nil {
-		respondError(w, apiError{
-			typ: errorBadData,
-			err: err,
-		}, nil)
-		return
-	}
-	for i:=0; i< len(s.Alerts);i++{
-		//fmt.Printf("%#v", s.Alerts[i].Labels)
-		caseId := s.Alerts[i].Labels.AlertName + s.Alerts[i].Labels.Instance
-
-		startAt, err := time.Parse(time.RFC3339Nano,s.Alerts[i].StartsAt)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Printf("s.Alerts[i].Labels.Group :%#v,len:%#v\n",s.Alerts[i].Labels.Group,len(s.Alerts[i].Labels.Group))
-		fmt.Printf("s description :%#v",strings.Split(s.Alerts[i].Annotations.Description,":"))
-		if(strings.Split(s.Alerts[i].Annotations.Description,":")[1] == "node"){
-			st.Name = s.Alerts[i].Labels.Group
-			st.Members = Member{Source:s.Alerts[i].Labels.Instance,Code:s.Alerts[i].Labels.AlertName,Grade:grade[s.Alerts[i].Labels.Severity],Time:startAt.Format("2006-01-02 15:04:05"),CaseId:GetMd5String(caseId),Description: s.Alerts[i].Annotations.Description}
-		}else{
-			st.Name = strings.Split(s.Alerts[i].Annotations.Description,":")[1]
-			st.Members = Member{Source:strings.Split(s.Alerts[i].Annotations.Description,":")[7],Code:s.Alerts[i].Labels.AlertName,Grade:grade[s.Alerts[i].Labels.Severity],Time:startAt.Format("2006-01-02 15:04:05"),CaseId:GetMd5String(caseId),Description: s.Alerts[i].Annotations.Description}
-		}
-
-
-		m.Structs = append(m.Structs, st)
-	}
-	//fmt.Printf("%#v", m)
-	output, err := xml.MarshalIndent(m, " "," ")
-	if err != nil {
-		fmt.Println(err.Error())
-		return
-	}
-	file, err := os.Create("/home/prometheus/"+fmt.Sprintf("%d~%s",time.Now().Unix(),GetRandomString(28)) + "~stdxml.dat")
-	file.Write([]byte(Header))
-	file.Write(output)
-	respond(w, "convert success")
+	return string(result)
 }
 
 func (api *API) delSilence(w http.ResponseWriter, r *http.Request) {
-	sids := route.Param(api.context(r), "sid")
-	sid, err := uuid.FromString(sids)
-	if err != nil {
+	sid := route.Param(r.Context(), "sid")
+
+	if err := api.silences.Expire(sid); err != nil {
 		respondError(w, apiError{
 			typ: errorBadData,
-			err: err,
-		}, nil)
-		return
-	}
-
-	if err := api.silences.Del(sid); err != nil {
-		respondError(w, apiError{
-			typ: errorInternal,
 			err: err,
 		}, nil)
 		return
@@ -954,7 +1134,7 @@ func (api *API) delSilence(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
-	sils, err := api.silences.All()
+	psils, err := api.silences.Query()
 	if err != nil {
 		respondError(w, apiError{
 			typ: errorInternal,
@@ -962,7 +1142,131 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
-	respond(w, sils)
+
+	matchers := []*labels.Matcher{}
+	if filter := r.FormValue("filter"); filter != "" {
+		matchers, err = parse.Matchers(filter)
+		if err != nil {
+			respondError(w, apiError{
+				typ: errorBadData,
+				err: err,
+			}, nil)
+			return
+		}
+	}
+
+	sils := []*types.Silence{}
+	for _, ps := range psils {
+		s, err := silenceFromProto(ps)
+		if err != nil {
+			respondError(w, apiError{
+				typ: errorInternal,
+				err: err,
+			}, nil)
+			return
+		}
+
+		if !matchesFilterLabels(s, matchers) {
+			continue
+		}
+		sils = append(sils, s)
+	}
+
+	var active, pending, expired, silences []*types.Silence
+
+	for _, s := range sils {
+		switch s.Status.State {
+		case "active":
+			active = append(active, s)
+		case "pending":
+			pending = append(pending, s)
+		case "expired":
+			expired = append(expired, s)
+		}
+	}
+
+	sort.Slice(active, func(i int, j int) bool {
+		return active[i].EndsAt.Before(active[j].EndsAt)
+	})
+	sort.Slice(pending, func(i int, j int) bool {
+		return pending[i].StartsAt.Before(pending[j].EndsAt)
+	})
+	sort.Slice(expired, func(i int, j int) bool {
+		return expired[i].EndsAt.After(expired[j].EndsAt)
+	})
+
+	silences = append(silences, active...)
+	silences = append(silences, pending...)
+	silences = append(silences, expired...)
+
+	respond(w, silences)
+}
+
+func matchesFilterLabels(s *types.Silence, matchers []*labels.Matcher) bool {
+	sms := map[string]string{}
+	for _, m := range s.Matchers {
+		sms[m.Name] = m.Value
+	}
+	for _, m := range matchers {
+		if v, prs := sms[m.Name]; !prs || !m.Matches(v) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func silenceToProto(s *types.Silence) (*silencepb.Silence, error) {
+	sil := &silencepb.Silence{
+		Id:        s.ID,
+		StartsAt:  s.StartsAt,
+		EndsAt:    s.EndsAt,
+		UpdatedAt: s.UpdatedAt,
+		Comment:   s.Comment,
+		CreatedBy: s.CreatedBy,
+	}
+	for _, m := range s.Matchers {
+		matcher := &silencepb.Matcher{
+			Name:    m.Name,
+			Pattern: m.Value,
+			Type:    silencepb.Matcher_EQUAL,
+		}
+		if m.IsRegex {
+			matcher.Type = silencepb.Matcher_REGEXP
+		}
+		sil.Matchers = append(sil.Matchers, matcher)
+	}
+	return sil, nil
+}
+
+func silenceFromProto(s *silencepb.Silence) (*types.Silence, error) {
+	sil := &types.Silence{
+		ID:        s.Id,
+		StartsAt:  s.StartsAt,
+		EndsAt:    s.EndsAt,
+		UpdatedAt: s.UpdatedAt,
+		Status: types.SilenceStatus{
+			State: types.CalcSilenceState(s.StartsAt, s.EndsAt),
+		},
+		Comment:   s.Comment,
+		CreatedBy: s.CreatedBy,
+	}
+	for _, m := range s.Matchers {
+		matcher := &types.Matcher{
+			Name:  m.Name,
+			Value: m.Pattern,
+		}
+		switch m.Type {
+		case silencepb.Matcher_EQUAL:
+		case silencepb.Matcher_REGEXP:
+			matcher.IsRegex = true
+		default:
+			return nil, fmt.Errorf("unknown matcher type")
+		}
+		sil.Matchers = append(sil.Matchers, matcher)
+	}
+
+	return sil, nil
 }
 
 type status string
@@ -988,9 +1292,9 @@ func respond(w http.ResponseWriter, data interface{}) {
 		Data:   data,
 	})
 	if err != nil {
+		log.Errorf("errorr: %v", err)
 		return
 	}
-
 	w.Write(b)
 }
 
@@ -1015,7 +1319,7 @@ func respondError(w http.ResponseWriter, apiErr apiError, data interface{}) {
 	if err != nil {
 		return
 	}
-	log.Errorf("api error: %s", apiErr)
+	log.Errorf("api error: %v", apiErr.Error())
 
 	w.Write(b)
 }
@@ -1029,4 +1333,102 @@ func receive(r *http.Request, v interface{}) error {
 		log.Debugf("Decoding request failed: %v", err)
 	}
 	return err
+}
+
+// bomc
+func (api *API) listBomcs(w http.ResponseWriter, r *http.Request) {
+
+	db, err := sql.Open("sqlite3", "./modal.db")
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE  IF NOT EXISTS bomc(Bid INTEGER PRIMARY KEY AUTOINCREMENT,bomcID VARCHAR(50) NOT NULL,description VARCHAR(128) NOT NULL)")
+	sqlStr := fmt.Sprintf("SELECT bomcID, description FROM bomc ")
+	rows, err := db.Query(sqlStr)
+	defer rows.Close()
+	checkErr(w, err)
+	var result []Bomc
+	for rows.Next() {
+		var user Bomc
+
+		err = rows.Scan(&user.BomcID, &user.Description)
+		checkErr(w, err)
+		result = append(result, user)
+	}
+
+	respond(w, &result)
+}
+
+func (api *API) addBomcs(w http.ResponseWriter, r *http.Request) {
+
+	var users []Bomc
+	if err := receive(r, &users); err != nil {
+		respondError(w, apiError{
+			typ: errorBadData,
+			err: err,
+		}, nil)
+		return
+	}
+
+	db, err := sql.Open("sqlite3", "./modal.db")
+	defer db.Close()
+	checkErr(w, err)
+	_, err = db.Exec("CREATE TABLE  IF NOT EXISTS bomc(Bid INTEGER PRIMARY KEY AUTOINCREMENT,bomcID VARCHAR(50) NOT NULL,description VARCHAR(128) NOT NULL)")
+	for _, user := range users {
+		stmt, err := db.Prepare("INSERT INTO bomc(bomcID,description) values(?,?)")
+		checkErr(w, err)
+		_, err = stmt.Exec(user.BomcID, user.Description)
+		checkErr(w, err)
+	}
+
+	respond(w, nil)
+}
+
+func (api *API) updateBomc(w http.ResponseWriter, r *http.Request) {
+	api.mtx.Lock()
+	defer api.mtx.Unlock()
+	bomcID := route.Param(r.Context(), "bomcID")
+	var user Bomc
+	if err := receive(r, &user); err != nil {
+		respondError(w, apiError{
+			typ: errorBadData,
+			err: err,
+		}, nil)
+		return
+	}
+	db, err := sql.Open("sqlite3", "./modal.db")
+	defer db.Close()
+
+	checkErr(w, err)
+	_, err = db.Exec("CREATE TABLE  IF NOT EXISTS bomc(Bid INTEGER PRIMARY KEY AUTOINCREMENT,bomcID VARCHAR(50) NOT NULL,description VARCHAR(128) NOT NULL)")
+
+	stmt, err := db.Prepare("update bomc set description=? where bomcID=?")
+	checkErr(w, err)
+
+	res, err := stmt.Exec(user.Description, bomcID)
+	checkErr(w, err)
+
+	affect, err := res.RowsAffected()
+	checkErr(w, err)
+
+	respond(w, affect)
+
+}
+
+func (api *API) deleteBomc(w http.ResponseWriter, r *http.Request) {
+	api.mtx.Lock()
+	defer api.mtx.Unlock()
+	bomcID := route.Param(r.Context(), "bomcID")
+
+	db, err := sql.Open("sqlite3", "./modal.db")
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE  IF NOT EXISTS bomc(Bid INTEGER PRIMARY KEY AUTOINCREMENT,bomcID VARCHAR(50) NOT NULL,description VARCHAR(128) NOT NULL)")
+
+	checkErr(w, err)
+	stmt, err := db.Prepare("delete from bomc where bomcID=?")
+	checkErr(w, err)
+
+	res, err := stmt.Exec(bomcID)
+	checkErr(w, err)
+
+	respond(w, res)
+
 }
